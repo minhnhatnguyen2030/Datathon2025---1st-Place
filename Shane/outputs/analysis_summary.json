@@ -1,0 +1,32 @@
+{
+  "recommendations": [
+    "Prioritise reducing driver behaviour score for high-exposure lanes; a 75th-to-50th percentile shift is modelled to save $1.15 per shipment (~0.2% reduction).",
+    "Strengthen delay mitigation across port congestion, ETA variation (hrs), fatigue monitoring score via dynamic re-routing, proactive customs management, and driver coaching to lower high-delay incidence.",
+    "Align inventory and planning processes to stabilise customs clearance time, order fulfilment readiness, loading & unloading time; integrate these metrics into weekly S&OP dashboards to control cost volatility.",
+    "Shift dispatching away from hour 5 (avg deviation 5.43 hrs) toward hour 22 (4.78 hrs) to claw back schedule adherence.",
+    "Allocate resources to peak months where shipping spend recently reached $307,407; negotiate surge capacity contracts ahead of those periods."
+  ],
+  "cost_model_metrics": {
+    "r2_test": -0.01038556453448547,
+    "mae_test": 277.70855457260933,
+    "baseline_mean_cost": 458.048535478238
+  },
+  "delay_model_metrics": {
+    "roc_auc": 0.5152147891146031,
+    "accuracy_at_0.5": 0.750031183734564,
+    "best_threshold": 0.25,
+    "best_f1": 0.40012015620306396,
+    "best_precision": 0.2502818489289741,
+    "best_recall": 0.9970059880239521,
+    "best_balanced_accuracy": 0.5008312827197758
+  },
+  "storyline": "GRB moved 32,065 shipments across 4 years of history, spending $14,729,842 overall (average $459 per load).\n\nMonthly spend recently closed at $307,407, which is -7.0% below the prior-quarter average.\n\nDelivery performance is under pressure: the average deviation is 5.18 hours, and 25.0% of loads fall into the highest delay quartile (\u2265 9.2 hours).\n\nDispatching at hour 5 correlates with the worst average delay (5.43 hours), whereas hour 22 trims lateness to 4.78 hours\u2014pointing to a clear scheduling lever.\n\nRisk segmentation shows Low Risk lanes run the highest unit cost ($463.12) across 3,110 shipments, signalling priority corridors for renegotiation and process control.\n\nScenario modelling suggests that reducing driver behaviour score could free up about $1.15 per shipment, or roughly $36,876 across the network if scaled.\n\nCurrent machine-learning diagnostics flag weak predictive power (cost model R\u00b2 -0.01; delay ROC-AUC 0.52), implying that richer operational data is needed to automate decisions.\n\nTaken together, the data points to a campaign that combines scheduling discipline, driver behaviour programmes, and door-to-door process tuning to bend both cost and delay curves back in line.",
+  "visualisations": [
+    "outputs/plots/shipping_cost_distribution.png",
+    "outputs/plots/monthly_shipping_trend.png",
+    "outputs/plots/hourly_delay_profile.png",
+    "outputs/plots/delay_vs_cost.png",
+    "outputs/plots/shipment_cost_map.png",
+    "outputs/plots/scenario_savings.png"
+  ]
+}
