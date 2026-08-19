@@ -1,0 +1,148 @@
+---
+title: "Probabilistic Forecast Reconciliation Simulation"
+author: "Sanghyun Kim"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    fig_caption: yes
+    number_sections: yes
+    self_contained: yes
+    theme: flatly
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Data preparation
+
+In this exercise, we'll be using a toy dataset to get the hang of how forecast reconciliation works in practice.
+
+```{r, warning = FALSE, message = FALSE}
+# install.packages("tsibble")
+library(tsibble)
+# install.packages("tsibbledata")
+library(tsibbledata) # for the aus_retail dataset
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(fable)
+library(fabletools)
+
+glimpse(aus_retail)
+```
+
+The dataset we'll be using for this exercise is monthly Australian retail turnover data (by `State` and `Industry`). For clear data visualisation, we'll use the last 10 years of data.
+
+```{r}
+data = aus_retail %>%
+  filter(Month >= yearmonth("2015 Jan")) %>%
+  as_tsibble(key = c(State, Industry), index = Month) # convert the dataframe to tsibble for time series analsis
+```
+
+This data set is not hierarchical time series, so we'll construct a hierarchy using `State` and `Industry` in the data.
+
+```{r}
+retail_hier = data %>%
+  aggregate_key(State/Industry, Turnover = sum(Turnover))
+```
+
+# Base (incoherent) forecast generation
+
+To generate base (incoherent) forecasts, we'll use the ETS time series model for the purposes of demonstration. ETS generally gives non-flat, sensible forecasts. Before building the model, let's split the data into training and test data to prevent overfitting. We'll use the last 18 months as test data.
+
+```{r}
+n_test = 18
+
+# define the cutoff
+cutoff = max(retail_hier$Month) - n_test
+
+train_data = retail_hier %>% filter(Month <= cutoff)
+test_data  = retail_hier %>% filter(Month >  cutoff)
+
+base_fit = train_data %>%
+  model(ETS = ETS(Turnover))
+```
+
+# Forecast reconciliation
+
+To reconcile base forecasts obtained above, we'll use three reconciliation methods: **Bottom-up**, **MinT - OLS** and **MinT - WLS**. To do so, we'll use `fable` and `fabletools` packages. After looking at the official documentation (see `Forecast Reconciliation` section), try to complete the following code to perform forecast reconciliation.
+
+```{r}
+# install.packages("fable")
+library(fable)
+# install.packages("fabletools")
+library(fabletools)
+
+recon_fc = base_fit %>%
+  reconcile(BU = , # Exercise: write code for the bottom-up approach
+            OLS = , # Exercise: write code for the MinT - OLS approach
+            WLS = ) %>% # Exercise: write code for the MinT - WLS approach)
+  forecast(h = n_test)
+```
+
+# Coherence check
+
+The following code verifies that the reconciled forecasts are coherent.
+
+```{r}
+# make the reconciliation forecast results a tibble
+recon_tibble = recon_fc %>%
+  as_tibble()
+
+# get the very first month
+first_month_data = recon_tibble %>% 
+  summarise(m1 = min(Month)) %>% 
+  pull(m1)
+
+# get the national total forecasts for the very first month
+total_m1 = recon_tibble %>% 
+  filter(Month == first_month_data, is_aggregated(State), is_aggregated(Industry)) %>%
+  select(.model, total = .mean)
+
+# sum up all state-level forecasts for the very first month
+sum_states_m1 = recon_tibble %>%
+  filter(Month == first_month_data, !is_aggregated(State), is_aggregated(Industry)) %>%
+  group_by(.model) %>%
+  summarise(sum_states = sum(.mean), .groups = "drop")
+
+# check coherence
+left_join(total_m1, sum_states_m1, by = ".model") %>%
+  mutate(diff_total_minus_states = round(total - sum_states))
+```
+
+# Method Comparison
+
+As we checked for coherence, let's see which model gives us the most accurate forecasts using two evaluation metrics: MAPE and RMSE.
+
+```{r}
+acc = accuracy(recon_fc, test_data)
+acc %>%
+  group_by(.model) %>%
+  summarise(MAPE = mean(MAPE, na.rm = TRUE),
+            RMSE = mean(RMSE, na.rm = TRUE)) %>%
+  arrange(MAPE)
+```
+
+Surprisingly, the ETS model (incoherent forecasts) achieves the smallest MAPE, while the bottom-up approach method achieves the smallest RMSE. Again, keep in mind that forecast reconciliation doesn't necessarily improve forecast accuracy, so you'll need to keep the balance between coherence and accuracy!
+
+Lastly, let's visualise state-level forecasts for NSW.
+
+```{r}
+nsw_hist = retail_hier %>%
+  filter(State == "New South Wales", is_aggregated(Industry))
+
+recon_nsw = recon_fc %>% 
+  filter(State == "New South Wales", is_aggregated(Industry))
+
+autoplot(recon_nsw, level = NULL) +
+  autolayer(nsw_hist, Turnover, alpha = 0.3) +
+  labs(title = paste("Reconciled forecasts by method –", "New South Wales", "(State total)"),
+       y = "Turnover ($m)") +
+  theme_bw()
+```
+
