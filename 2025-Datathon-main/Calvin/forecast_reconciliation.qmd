@@ -1,0 +1,449 @@
+---
+title: "Forecast Reconciliation for SCM"
+date: today
+format:
+  html:
+    theme: litera
+    embed-resources: true 
+    code-tools: true
+    toc: true
+    toc-location: right
+    number-sections: true
+    link-external-newwindow: true
+    link-external-icon: true
+    math: katex
+---
+
+# Libraries and Loading Data
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = F, warning = F, fig.align='center', fig.dim=c(10, 6))
+```
+
+```{r}
+library(tidyverse)
+library(sf)
+library(viridis)
+library(lubridate)
+library(tsibble)
+library(fable)
+library(fabletools)
+library(feasts)
+library(janitor)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(ggridges)
+library(knitr)
+library(forecast)
+library(patchwork)
+
+data = read_csv("dynamic_supply_chain_logistics_dataset.csv", show_col_types = FALSE) %>%
+  rename(lon = vehicle_gps_longitude, lat = vehicle_gps_latitude) %>%
+  mutate(
+    lon = suppressWarnings(as.numeric(lon)),
+    lat = suppressWarnings(as.numeric(lat)),
+    timestamp = lubridate::ymd_hms(timestamp, quiet = TRUE),
+    delay_hours = pmax(suppressWarnings(as.numeric(delivery_time_deviation)), 0)
+  ) %>%
+  filter(!is.na(lon), !is.na(lat), !is.na(timestamp))
+```
+
+# Visualisations
+
+We provide delay probabilities overlaid on the US map, and a subset of it on the SoCal region.
+
+```{r}
+# Base map
+us = ne_states(country = "United States of America",
+                              returnclass = "sf")
+us_conus = subset(us, !name %in% c("Alaska","Hawaii","Puerto Rico")) |>
+  st_transform(4326)
+
+pts = st_as_sf(data, coords = c("lon","lat"), crs = 4326, remove = FALSE)
+
+# Clip points inside
+inside = lengths(st_within(pts, us_conus)) > 0
+pts_in = pts[inside, , drop = FALSE]
+
+# thin for legibility
+set.seed(1)
+pts_plot = if (nrow(pts_in) > 80000) pts_in[sample(nrow(pts_in), 80000), ] else pts_in
+
+us_outline = st_cast(us_conus, "MULTILINESTRING")
+
+# Plot delay probability
+color_var = "delay_probability"
+has_color = color_var %in% names(pts_plot)
+
+p = ggplot() +
+  geom_sf(data = us_conus, fill = "grey98", color = "grey90", linewidth = 0.2) +
+  { if (has_color)
+      geom_point(data = st_drop_geometry(pts_plot),
+                 aes(x = lon, y = lat, color = .data[[color_var]]),
+                 alpha = 0.35, size = 0.25)
+    else
+      geom_point(data = st_drop_geometry(pts_plot),
+                 aes(x = lon, y = lat),
+                 color = "steelblue", alpha = 0.35, size = 0.25)
+  } +
+  geom_sf(data = us_outline, fill = NA, color = "grey20", linewidth = 0.3) +
+  coord_sf(xlim = st_bbox(us_conus)[c("xmin","xmax")],
+           ylim = st_bbox(us_conus)[c("ymin","ymax")],
+           expand = FALSE, clip = "on") +
+  { if (has_color) scale_color_viridis_c(name = color_var, limits = c(0,1)) } +
+  labs(title = "Delay Probabilities: All States",
+       x = "Longitude", y = "Latitude") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank())
+
+print(p)
+```
+
+## Southern California
+
+```{r}
+# California + SoCal bbox with border
+# Polygon
+ca = rnaturalearth::ne_states(country = "United States of America",
+                              returnclass = "sf") |>
+  subset(name == "California") |>
+  st_transform(4326)
+
+# points as sf 
+pts_all = st_as_sf(data, coords = c("lon","lat"), crs = 4326, remove = FALSE)
+
+# only in CA
+pts_ca = st_intersection(pts_all, ca)
+
+# crop
+socal_bbox = c(xmin = -121, ymin = 32, xmax = -114, ymax = 36)  # note: st_bbox expects xmin,ymin,xmax,ymax
+bbox_poly = st_as_sfc(st_bbox(socal_bbox, crs = sf::st_crs(4326)))
+pts_socal = st_intersection(pts_ca, bbox_poly)
+
+cat("CA points:", nrow(pts_ca), " | SoCal-in-CA points:", nrow(pts_socal), "\n")
+
+# plot
+ca_outline = sf::st_cast(ca, "MULTILINESTRING")
+
+p_socal = ggplot() +
+  geom_sf(data = ca, fill = "grey98", color = "grey85", linewidth = 0.2) +
+  # bubble layer
+  geom_sf(
+    data = pts_socal,
+    aes(color = delay_probability, size = delay_probability),
+    alpha = 0.55
+  ) +
+  geom_sf(data = ca_outline, fill = NA, color = "grey20", linewidth = 0.4) +
+  coord_sf(xlim = c(socal_bbox["xmin"], socal_bbox["xmax"]),
+           ylim = c(socal_bbox["ymin"], c(socal_bbox["ymax"])),
+           expand = FALSE, clip = "on") +
+  scale_color_viridis_c(name = "delay_probability", limits = c(0, 1)) +
+  scale_size_continuous(range = c(2, 5), name = "delay_probability", guide = "none") +
+  labs(title = "Delay Probabilities: Southern California",
+       x = "Longitude", y = "Latitude") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank())
+
+print(p_socal)
+```
+
+# Variables
+
+For reconciliation, we should use an **additive** target variable. Thus, we define a new target based on target D (Delivery Time Deviation) as **total delay time**, given as $$T=\sum \max\{D_i, 0\},\quad D_i=\text{delivery time deviation}.$$For this reason, we add the `delay_time` variable.
+
+```{r}
+data = data %>% mutate(delay_time = pmax(delivery_time_deviation, 0))
+```
+
+We also add a `State` variable for the two-level hierarchy on `State/cell_id`.
+
+```{r}
+# 1) Make fields numeric + additive ingredient (row-level)
+data = data %>%
+  mutate(
+    lon = suppressWarnings(as.numeric(lon)),
+    lat = suppressWarnings(as.numeric(lat)),
+    timestamp = ymd_hms(timestamp, quiet = TRUE),
+    delay_hours = pmax(as.numeric(delivery_time_deviation), 0)
+  ) %>%
+  filter(!is.na(lon), !is.na(lat), !is.na(timestamp))
+
+# 2) Attach US state (for two-level hierarchy: TOTAL → state → cell_id)
+us = ne_states(country = "United States of America", returnclass = "sf")
+us_conus = subset(us, !name %in% c("Alaska","Hawaii","Puerto Rico")) %>% st_transform(4326)
+
+pts = st_as_sf(data, coords = c("lon","lat"), crs = 4326, remove = FALSE)
+data = st_join(pts, us_conus["name"], left = TRUE) %>% st_drop_geometry()
+names(data)[names(data) == "name"] = "state"
+data = filter(data, !is.na(state))
+```
+
+# Forecast
+
+We first generate the *hierarchical* time series data associated with `data`. We group the data by months as well to get better totals; we tried hourly (default) and daily but don't get any good results.
+
+```{r}
+# Make month + cargo
+data = data %>%
+  mutate(
+    Month = yearmonth(timestamp),
+    cargo = if_else(as.numeric(cargo_condition_status) <= 0.5, "Poor", "Good")
+  ) %>%
+  filter(!is.na(state))
+
+# One row per Month × state × cargo (sum within month)
+monthly = data %>%
+  group_by(Month, state, cargo) %>%
+  summarise(total_delay_hours = sum(delay_hours, na.rm = TRUE), .groups = "drop")
+
+# complete panel
+ts_m = monthly %>%
+  as_tsibble(index = Month, key = c(state, cargo)) %>%
+  fill_gaps(.full = TRUE) %>%
+  mutate(total_delay_hours = coalesce(total_delay_hours, 0)) %>%
+  aggregate_key(state / cargo, total_delay_hours = sum(total_delay_hours))
+```
+
+## Train-Test Split
+
+```{r}
+# Split (last 12 months)
+n_test = 12
+cutoff = max(ts_m$Month, na.rm = TRUE) - n_test
+train_data = ts_m %>% filter(Month <= cutoff)
+test_data  = ts_m %>% filter(Month >  cutoff)
+```
+
+When we try to fit an ETS model, we generally get NULL models for a lot of these entries, so we counteract this by doing the specified ETS model for the non-NULL models, and set the rest as a TSLM model.
+
+- ETS (additive) captures level/trend/season for non-negative flows and adapts well when there’s actual signal.
+
+- TSLM(~1) (intercept-only) is a safe fallback for all-zero or ultra-sparse series; it yields a valid (typically zero) forecast instead of a <NULL model>, keeping the hierarchy intact for reconciliation.
+
+```{r}
+# Base fit
+fit = train_data %>% model(ETS = ETS(total_delay_hours ~ error("A") + season("A")))
+
+# Replace NULLs in-place with TSLM(~1)
+fb  = train_data %>% model(ETS = TSLM(total_delay_hours ~ 1))
+
+idx = is_null_model(fit$ETS)
+fit$ETS[idx] = fb$ETS[idx]
+```
+
+## Reconciliation
+
+```{r}
+# Reconcile & forecast
+recon_fc = fit %>%
+  reconcile(
+    BU  = bottom_up(ETS),
+    OLS = min_trace(ETS, "ols"),
+    WLS = min_trace(ETS, "wls_struct")
+  ) %>%
+  forecast(h = n_test)
+```
+
+### Diagnostics
+
+```{r}
+rt = recon_fc %>%
+  as_tibble() %>%
+  filter(.model %in% c("BU","OLS","WLS"))
+
+# TOTAL vs sum of STATES (each month)
+totals = rt %>% filter(is_aggregated(state), is_aggregated(cargo)) %>%
+  select(.model, Month, total = .mean)
+
+sum_states = rt %>% filter(!is_aggregated(state), is_aggregated(cargo)) %>%
+  group_by(.model, Month) %>%
+  summarise(sum_states = sum(.mean, na.rm = TRUE), .groups = "drop")
+
+left_join(totals, sum_states, by = c(".model","Month")) %>%
+  mutate(diff = round(total - sum_states, 10)) %>%
+  group_by(.model) %>%
+  summarise(max_abs_diff = max(abs(diff), na.rm = TRUE), .groups = "drop")
+
+# For each state: parent vs sum of its cargo children
+parents = rt %>% filter(!is_aggregated(state), is_aggregated(cargo)) %>%
+  select(.model, Month, state, parent = .mean)
+
+children = rt %>% filter(!is_aggregated(state), !is_aggregated(cargo)) %>%
+  group_by(.model, Month, state) %>%
+  summarise(sum_children = sum(.mean, na.rm = TRUE), .groups = "drop")
+
+left_join(parents, children, by = c(".model","Month","state")) %>%
+  mutate(diff = round(parent - sum_children, 10)) %>%
+  group_by(.model) %>%
+  summarise(max_abs_diff = max(abs(diff), na.rm = TRUE), .groups = "drop")
+```
+
+# Comparison
+
+```{r}
+acc = accuracy(recon_fc, test_data)
+res = acc %>%
+  group_by(.model) %>%
+  summarise(MAE = mean(MAE, na.rm = TRUE),
+            RMSE = mean(RMSE, na.rm = TRUE)) %>%
+  arrange(RMSE)
+
+kable(res, align = "ccc")
+```
+
+Seems that OLS is the best performing model.
+
+## Plot
+
+```{r}
+# History: California state total (cargo aggregated)
+ca_hist = ts_m %>%
+  filter(state == "California", is_aggregated(cargo))
+
+# Reconciled forecasts: California state total (cargo aggregated)
+recon_ca = recon_fc %>%
+  filter(state == "California", is_aggregated(cargo))
+
+p1 = autoplot(recon_ca, level = NULL) +
+  autolayer(ca_hist, total_delay_hours, alpha = 0.3) +
+  labs(
+    title = "Reconciled forecasts by method – California (state total)",
+    y = "Total delay-hours (monthly)"
+  ) +
+  theme_bw()
+
+p1
+```
+
+Overall seems like even with reconciliation, we don't get a more accurate model. This could be attributed to the input variable not being very "significant" in difference.
+
+## Post-Prediction EDA: Delay Time vs Cargo Condition Status
+
+```{r}
+data = data %>% mutate(cargo = 
+                         if_else(as.numeric(cargo_condition_status) <= 0.5, "Poor", "Good"))
+p2 = ggplot(data, aes(x = cargo, y = delay_time, fill = cargo)) +
+  geom_boxplot(outlier.alpha = 0.15, width = 0.65) +
+  labs(title = "Delay time by cargo condition",
+       x = NULL, y = "Delay time (hours)") +
+  theme_bw()
+
+p3 = ggplot(data, aes(x = delay_time, y = cargo, fill = cargo)) +
+  geom_density_ridges(alpha = 0.8, scale = 1.1, rel_min_height = 0.001, color = "white") +
+  labs(title = "Distribution of delay time by cargo condition",
+       x = "Delay time (hours)", y = NULL) +
+  theme_bw()
+
+p_eda = p2 + p3
+p_eda
+```
+
+So really not much of a difference overall; this is not a very relevant feature at least.
+
+# ARIMA
+
+We try a simple ARIMA model as a baseline comparison.
+
+```{r}
+monthly = data %>%
+  filter(state == "California") %>%
+  mutate(Month = yearmonth(timestamp)) %>%
+  group_by(Month) %>%
+  summarise(y = sum(delay_time, na.rm = TRUE), .groups = "drop") %>%
+  arrange(Month)
+
+# Make the month index complete and zero-fill any gaps
+monthly_full = monthly %>%
+  as_tsibble(index = Month) %>%
+  fill_gaps() %>%
+  mutate(y = coalesce(y, 0)) %>%
+  as_tibble()
+
+# Convert to base R ts (freq = 12) so it prints in the Jan..Dec matrix form
+start_y = year(as_date(min(monthly_full$Month)))
+start_m = month(as_date(min(monthly_full$Month)))
+y_ts = ts(monthly_full$y, start = c(start_y, start_m), frequency = 12)
+
+y_ts
+```
+
+ARIMA/SARIMA is appropriate here because the monthly delay-hours series is non-stationary (level shifts, uneven mean) and appears to have a seasonal pattern; ARIMA handles this by applying regular and seasonal differencing ($d$, $D$) before fitting AR/MA dynamics. Using `auto.arima` will automatically choose the needed differencing and seasonal terms, with residual checks confirming stationarity after differencing.
+
+## Fitting and Residuals
+
+```{r}
+# Split (to before 2024)
+freq = frequency(y_ts)
+ti   = time(y_ts)
+
+# indices by year
+idx_train = which(floor(ti) < 2024)    # 2021–2023
+idx_test  = which(floor(ti) == 2024)   # 2024 only
+
+# build contiguous ts objects
+y_train = ts(y_ts[idx_train], start = start(y_ts), frequency = freq)
+y_test  = ts(y_ts[idx_test],  start = c(2024, 1),  frequency = freq)
+
+# quick sanity
+c(length_train = length(y_train), length_test = length(y_test))
+start(y_train); end(y_train)
+start(y_test);  end(y_test)
+
+fit = auto.arima(y_train , stepwise = FALSE, approximation = FALSE, stationary = FALSE)
+checkresiduals(fit)
+```
+
+## Interpretation
+
+We find that the algorithm classified ARIMA(0, 0, 0) meaning there really is no useful prediction method without incorporating other variables. For one final check we will try using the $x$-regressor as `cargo_condition_status`.
+
+# With $x$-regressor
+
+```{r}
+# build monthly target + raw regressor (mean cargo condition per month)
+monthly_x = data %>%
+  mutate(Month = yearmonth(timestamp),
+         ccs = as.numeric(cargo_condition_status)) %>%
+  group_by(Month) %>%
+  summarise(
+    y = sum(delay_time, na.rm = TRUE),         # target
+    ccs_mean = mean(ccs, na.rm = TRUE),        # raw regressor (0..1)
+    .groups = "drop"
+  ) %>%
+  arrange(Month) %>%
+  # make the month index complete; zero-fill y; fill any missing ccs_mean
+  as_tsibble(index = Month) %>%
+  fill_gaps() %>%
+  mutate(
+    y = coalesce(y, 0),
+    ccs_mean = tidyr::replace_na(ccs_mean, NA_real_)
+  ) %>%
+  as_tibble() %>%
+  fill(ccs_mean, .direction = "downup") %>%   # forward/back fill if needed
+  mutate(ccs_mean = coalesce(ccs_mean, mean(ccs_mean, na.rm = TRUE)))
+
+# convert to ts objects (freq = 12)
+start_y = year(as_date(min(monthly_x$Month)))
+start_m = month(as_date(min(monthly_x$Month)))
+y_ts = ts(monthly_x$y,        start = c(start_y, start_m), frequency = 12)
+x_ts = ts(monthly_x$ccs_mean, start = c(start_y, start_m), frequency = 12)
+
+# calendar split: train = 2021–2023, test = 2024
+ti = time(y_ts)
+freq = frequency(y_ts)
+idx_train = which(floor(ti) < 2024)
+idx_test  = which(floor(ti) == 2024)
+
+y_train = ts(y_ts[idx_train], start = start(y_ts), frequency = freq)
+x_train = ts(x_ts[idx_train], start = start(x_ts), frequency = freq)
+y_test  = ts(y_ts[idx_test],  start = c(2024, 1),  frequency = freq)
+x_test  = ts(x_ts[idx_test],  start = c(2024, 1),  frequency = freq)
+
+# fit ARIMA with xreg (raw cargo condition)
+fit_x = auto.arima(y_train, xreg = x_train, stepwise = FALSE, approximation = FALSE)
+checkresiduals(fit_x)
+```
+
+Still ARIMA(0, 0, 0), so we can conclude that at this monthly aggregation, there’s no exploitable temporal structure and the raw cargo condition doesn’t add predictive power (as used). 
+
+In other words, at the monthly level, cargo condition has no statistically significant linear effect on delay-hours.

@@ -1,0 +1,11 @@
+KPI,Value,Unit,Value_fmt
+Total_Shipping_Cost,14729841.7968859,$,"14,729,842"
+Unit_Cost,459.3744517974708,$/record,459.3745
+Lead_Time_Mean,5.227502056448464,days,5.2275
+Loading_Unloading_Time_Mean,2.2916691620610625,hours,2.2917
+Delay_Probability_Avg,0.6990768456604328,0–1,0.6991
+On_Time_Rate,0.3009231543395672,0–1,0.3009
+Time_Deviation_Mean,5.177648068922158,hours,5.1776
+Late_Rate_from_Deviation(p75),,0–1,-
+CO2e_Total_Proxy,811792.2518950863,kg CO2e,"811,792"
+CO2e_Intensity_Proxy,25.317082547796236,kg CO2e / record,25.3171
