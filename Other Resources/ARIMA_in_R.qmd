@@ -1,0 +1,96 @@
+---
+title: "ARIMA Models in R"
+subtitle: "A Primer for Turning Seasonal Messes into Leaderboard Points"
+date: today
+author: "Calvin L."
+format:
+  html:
+    theme: litera
+    embed-resources: true 
+    code-tools: true
+    toc: true
+    toc-location: right
+    number-sections: true
+    link-external-newwindow: true
+    link-external-icon: true
+    math: katex
+---
+
+# Time Series Data in `R`
+
+You can directly obtain various time series data sets using the `timeSeriesDataSets` package. We will also need the `forecast` package in order to fit the ARIMA model into the dataset.
+
+```{r include = F}
+knitr::opts_chunk$set(warning = F, message = F, fig.align = "center", fig.dim = c(10, 6))
+```
+
+```{r}
+library(forecast)
+library(timeSeriesDataSets)
+
+# Other libraries
+library(tidyverse)
+library(knitr)
+```
+
+## Electricity Production Data
+
+Consider the `elec_ts` data from the `timeSeriesDataSets` package. It provides monthly electricity output from 1956 to 1995. We provide a visualisation of the data below.
+
+```{r}
+x = elec_ts
+autoplot(x) + labs(x = "Time (Year)", y = "Electricity Production (GWh)", title = "Electricity Production (1956 - 1995)") + theme_linedraw()
+```
+
+The data is not stationary, so we may have to resort to the ARIMA model via differencing, as opposed to an AR/MA/ARMA model, which require stationarity (and MA is stationary by definition). The `forecast` package has a function `auto.arima` which does this for us, so that we do not have to tweak $(p, d, q)$ ourselves.
+
+## ARIMA Model
+
+```{r}
+fit = auto.arima(x, stepwise = FALSE, approximation = FALSE, stationary = FALSE)
+```
+
+We can check residuals using `checkresiduals` and this tells us the residuals against time, the ACF of residuals, and their histogram. Based on these, we may want to tweak the model a bit, particularly with regards to the seasonal components, and deal with outliers by transformations. But that is left for another time.
+
+```{r}
+checkresiduals(fit)
+```
+
+We now use the model to forecast the future electricity production in the next 20 periods.
+
+```{r}
+fc = forecast(fit, h = 25)
+autoplot(fc) + labs(x = "Time (Year)", y = "Electricity Production (GWh)", title = "Electricity Production ARIMA") + theme_linedraw() + 
+  geom_vline(xintercept = 1995 + 11/12, linetype = "dashed", color = "salmon")
+```
+
+## Train-Test Split
+
+We split the data and hold out the last $h$ periods to test our model based on the everything before that. This gives us a measure of how well our model would perform.
+
+```{r}
+h = 24 # 2 years
+n = length(x)
+
+x_train = window(x, end = time(x)[n - h])
+x_test  = window(x, start = time(x)[n - h + 1])
+
+fit = auto.arima(x_train)
+fc  = forecast(fit, h = length(x_test))
+
+# Metrics (Training + Test rows)
+metrics = accuracy(fc, x_test) %>% round(3) %>% as.data.frame() %>% kable()
+metrics
+
+cut_x = tail(time(x_train), 1)   # last observed time in the training set
+
+autoplot(fc) +
+  autolayer(x_train, series = "Observed (train)") +
+  autolayer(x_test,  series = "Observed (test)") +
+  geom_vline(xintercept = cut_x, linetype = "dashed", color = "salmon") +
+  labs(title = "Forecast with train/test split",
+       x = "Time", y = NULL) + theme_linedraw()
+```
+
+
+
